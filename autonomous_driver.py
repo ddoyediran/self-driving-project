@@ -32,7 +32,8 @@ class AutonomousDriver(Node):
         # Enable all advanced graph optimizations (fusing nodes, constant folding)
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         
-        self.encoder_session = ort.InferenceSession('dinov2_encoder.onnx', sess_options=opts, providers=['CPUExecutionProvider'])
+        # self.encoder_session = ort.InferenceSession('dinov2_encoder.onnx', sess_options=opts, providers=['CPUExecutionProvider'])
+        self.encoder_session = ort.InferenceSession('dinov2_encoder_quantized.onnx', sess_options=opts, providers=['CPUExecutionProvider'])
         self.actor_session = ort.InferenceSession('actor_policy.onnx', sess_options=opts, providers=['CPUExecutionProvider'])
         
         self.encoder_input_name = self.encoder_session.get_inputs()[0].name
