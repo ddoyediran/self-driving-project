@@ -19,14 +19,14 @@ class AutonomousDriver(Node):
         self.latest_image = None
         self.is_driving = True
         
-        # --- AI GAIN MULTIPLIERS ---
-        # If the AI outputs 0.05, it multiplies by 3.0 to output 0.15 (Overcoming the deadzone)
-        self.STEERING_GAIN = 3.0
-        self.THROTTLE_GAIN = 4.0
+        # --- THE AMPLIFIER ---
+        # The AI suffers from "Regression to the Mean" (whispering its steering).
+        # We multiply it by 100 to force the servo out of its deadzone!
+        self.STEERING_GAIN = 100.0 
         
         print("[AI] Optimizing ONNX for Raspberry Pi 5 (4 Cores)...")
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 4  # Use all 4 Pi 5 cores!
+        opts.intra_op_num_threads = 4 
         opts.inter_op_num_threads = 1
         
         self.encoder_session = ort.InferenceSession('dinov2_encoder.onnx', sess_options=opts, providers=['CPUExecutionProvider'])
@@ -65,8 +65,7 @@ class AutonomousDriver(Node):
         return np.expand_dims(chw, axis=0)
 
     def safe_publish(self, twist):
-        # Prevents the Ctrl+C crash by checking if ROS is still alive
-        if rclpy.ok() and self.is_driving:
+        if rclpy.ok():
             try:
                 self.cmd_pub.publish(twist)
             except Exception:
@@ -79,6 +78,9 @@ class AutonomousDriver(Node):
             
         print("[SYSTEM] Camera detected! Starting Autonomous AI Loop...")
         
+        # Slowed down slightly so the 0.7 FPS AI has more time to see the curves
+        CRUISE_SPEED = 0.08 
+        
         while self.is_driving:
             start_time = time.monotonic()
             
@@ -90,31 +92,50 @@ class AutonomousDriver(Node):
             latent_vector = self.encoder_session.run(None, {self.encoder_input_name: tensor_img})[0]
             action = self.actor_session.run(None, {self.actor_input_name: latent_vector})[0]
             
-            # Apply the Multipliers!
             raw_steer = float(action[0][0])
-            raw_throttle = float(action[0][1])
-            
             steering = raw_steer * self.STEERING_GAIN
-            throttle = raw_throttle * self.THROTTLE_GAIN
+            throttle = CRUISE_SPEED
+            
+            # HARD CAP: Prevent the massive gain from breaking the physical servo
+            steering = max(min(steering, 1.0), -1.0)
             
             twist = Twist()
             twist.angular.z = steering
             twist.linear.x = throttle
-            self.safe_publish(twist)
+            
+            if self.is_driving:
+                self.safe_publish(twist)
             
             process_time = time.monotonic() - start_time
             fps = 1.0 / process_time if process_time > 0 else 0.0
-            print(f"AI Steer: {steering:+.3f} | Throttle: {throttle:+.3f} | Speed: {fps:.1f} FPS")
+            print(f"AI Steer: {steering:+.3f} (Raw: {raw_steer:+.3f}) | Throttle: {throttle:+.3f} | {fps:.1f} FPS")
 
     def emergency_stop(self):
-        print("\n[SYSTEM] EMERGENCY STOP. Halting motors...")
-        self.is_driving = False
+        print("\n[SYSTEM] EMERGENCY STOP. Waiting for AI thread to finish...")
+        self.is_driving = False 
+        
+        if self.ai_thread.is_alive():
+            self.ai_thread.join() 
+            
+        print("[SYSTEM] AI Halted. Sending zero velocity to motors...")
         twist = Twist()
         twist.angular.z = 0.0
         twist.linear.x = 0.0
+        
         if rclpy.ok():
             try:
+                # Send the stop command
                 self.cmd_pub.publish(twist)
+                print("[SYSTEM] Stop command sent...")
+                
+                # CRITICAL FIX: Sleep for 0.5s to let the network buffer actually deliver the message!
+                time.sleep(0.5) 
+                
+                # Send it one more time just in case
+                self.cmd_pub.publish(twist)
+                time.sleep(0.2)
+                
+                print("[SYSTEM] Motors successfully halted.")
             except:
                 pass
 
@@ -127,8 +148,6 @@ def main(args=None):
     except KeyboardInterrupt:
         node.emergency_stop()
     finally:
-        node.is_driving = False
-        node.ai_thread.join()
         if rclpy.ok():
             node.destroy_node()
             rclpy.shutdown()
