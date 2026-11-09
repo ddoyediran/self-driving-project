@@ -19,15 +19,18 @@ class AutonomousDriver(Node):
         self.latest_image = None
         self.is_driving = True
         
-        # --- THE AMPLIFIER ---
-        # The AI suffers from "Regression to the Mean" (whispering its steering).
-        # We multiply it by 100 to force the servo out of its deadzone!
         self.STEERING_GAIN = 100.0 
         
-        print("[AI] Optimizing ONNX for Raspberry Pi 5 (4 Cores)...")
+        # --- SMOOTHING FILTER ---
+        self.current_steering = 0.0
+        self.SMOOTHING_FACTOR = 0.6 # 1.0 = instant snap, 0.1 = very sluggish
+        
+        print("[AI] Optimizing ONNX for Raspberry Pi 5 (Max Optimization)...")
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 4 
         opts.inter_op_num_threads = 1
+        # Enable all advanced graph optimizations (fusing nodes, constant folding)
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         
         self.encoder_session = ort.InferenceSession('dinov2_encoder.onnx', sess_options=opts, providers=['CPUExecutionProvider'])
         self.actor_session = ort.InferenceSession('actor_policy.onnx', sess_options=opts, providers=['CPUExecutionProvider'])
@@ -78,8 +81,9 @@ class AutonomousDriver(Node):
             
         print("[SYSTEM] Camera detected! Starting Autonomous AI Loop...")
         
-        # Slowed down slightly so the 0.7 FPS AI has more time to see the curves
-        CRUISE_SPEED = 0.08 
+        # --- DROPPED CRUISE SPEED ---
+        # The AI needs more time to process the curves. 
+        CRUISE_SPEED = 0.05 
         
         while self.is_driving:
             start_time = time.monotonic()
@@ -93,22 +97,24 @@ class AutonomousDriver(Node):
             action = self.actor_session.run(None, {self.actor_input_name: latent_vector})[0]
             
             raw_steer = float(action[0][0])
-            steering = raw_steer * self.STEERING_GAIN
-            throttle = CRUISE_SPEED
+            target_steering = raw_steer * self.STEERING_GAIN
             
-            # HARD CAP: Prevent the massive gain from breaking the physical servo
-            steering = max(min(steering, 1.0), -1.0)
+            # HARD CAP
+            target_steering = max(min(target_steering, 1.0), -1.0)
+            
+            # --- APPLY SMOOTHING FILTER ---
+            self.current_steering = (self.SMOOTHING_FACTOR * target_steering) + ((1.0 - self.SMOOTHING_FACTOR) * self.current_steering)
             
             twist = Twist()
-            twist.angular.z = steering
-            twist.linear.x = throttle
+            twist.angular.z = self.current_steering
+            twist.linear.x = CRUISE_SPEED
             
             if self.is_driving:
                 self.safe_publish(twist)
             
             process_time = time.monotonic() - start_time
             fps = 1.0 / process_time if process_time > 0 else 0.0
-            print(f"AI Steer: {steering:+.3f} (Raw: {raw_steer:+.3f}) | Throttle: {throttle:+.3f} | {fps:.1f} FPS")
+            print(f"AI Steer: {self.current_steering:+.3f} (Target: {target_steering:+.3f}) | Throttle: {CRUISE_SPEED:+.3f} | {fps:.1f} FPS")
 
     def emergency_stop(self):
         print("\n[SYSTEM] EMERGENCY STOP. Waiting for AI thread to finish...")
@@ -124,17 +130,10 @@ class AutonomousDriver(Node):
         
         if rclpy.ok():
             try:
-                # Send the stop command
                 self.cmd_pub.publish(twist)
-                print("[SYSTEM] Stop command sent...")
-                
-                # CRITICAL FIX: Sleep for 0.5s to let the network buffer actually deliver the message!
                 time.sleep(0.5) 
-                
-                # Send it one more time just in case
                 self.cmd_pub.publish(twist)
                 time.sleep(0.2)
-                
                 print("[SYSTEM] Motors successfully halted.")
             except:
                 pass
